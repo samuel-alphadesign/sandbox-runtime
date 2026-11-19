@@ -1,0 +1,39 @@
+name: Shared memory host qualification
+on:
+  push:
+    branches: [codex/qualify-dev-shm]
+permissions:
+  contents: read
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.2
+      - name: Prepare Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libseccomp-dev gcc ripgrep socat
+          uname -a
+          bwrap --version
+          stat -f -c 'type=%T' /dev/shm
+          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sysctl kernel.apparmor_restrict_unprivileged_userns
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --unshare-pid --cap-drop ALL --ro-bind / / --proc /proc /bin/true
+          bun install
+          bun run build:seccomp
+      - name: Exercise shared memory and filesystem policy
+        run: |
+          bun test --rerun-each 35 test/sandbox/linux-shared-memory.test.ts
+          bun test test/sandbox/linux-bwrap-args-file.test.ts test/sandbox/linux-mount-plan-record.test.ts test/sandbox/linux-one-mount-per-destination.test.ts test/sandbox/pid-namespace-isolation.test.ts
