@@ -1888,6 +1888,41 @@ function retryingTransient<T>(attempt: () => T): T {
  * replace two of them after the pins are spliced in, and /sys is kernel
  * state — and the '/' read-deny expansion must not hide one either. */
 const KERNEL_TOP_LEVEL_DIRS = ['/proc', '/dev', '/sys']
+const SHARED_MEMORY_DIR = '/dev/shm'
+
+function withDeviceMount(
+  filesystemArgs: string[],
+  sharedMemoryRoots: readonly string[],
+): string[] {
+  const beforeDevice: string[] = []
+  let afterDevice: Array<{ dest: string; args: string[] }> = []
+  for (let i = 0; i < filesystemArgs.length; ) {
+    // The filesystem planner emits two words for tmpfs and three for binds.
+    const end = i + (filesystemArgs[i] === '--tmpfs' ? 2 : 3)
+    const args = filesystemArgs.slice(i, end)
+    const dest = args[args.length - 1]!
+    i = end
+
+    if (sharedMemoryRoots.some(root => isAtOrUnder(dest, root))) {
+      afterDevice.push({ dest, args })
+    } else {
+      // A later deny at an ancestor buries earlier mounts. Do not restore
+      // those grants above the synthetic device tree.
+      if (args[0] !== '--bind') {
+        afterDevice = afterDevice.filter(
+          mount => !isAtOrUnder(mount.dest, dest),
+        )
+      }
+      beforeDevice.push(...args)
+    }
+  }
+  return [
+    ...beforeDevice,
+    '--dev',
+    '/dev',
+    ...afterDevice.flatMap(mount => mount.args),
+  ]
+}
 
 /**
  * A self-bind ("pin") for every directory between a seed (where a deny bind,
@@ -2101,14 +2136,25 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
-): Promise<{ args: string[]; mandatoryDenyArgs: number }> {
-  const args: string[] = []
+): Promise<{
+  args: string[]
+  mandatoryDenyArgs: number
+  sharedMemoryRoots: string[]
+}> {
+  const args = [writeConfig ? '--ro-bind' : '--bind', '/', '/']
+  const beneathAllowBinds = args.length
   const startedIn = workingDirectory()
   // fs already imported
 
   // Collect normalized allowed write paths. Populated in the writeConfig
   // block, read again in the denyRead loop to re-bind writes under tmpfs.
   const allowedWritePaths: string[] = []
+  const sharedMemoryRoots: string[] = []
+  const isHiddenDevicePath = (location: string): boolean =>
+    location.startsWith('/dev/') &&
+    !sharedMemoryRoots.some(
+      root => isAtOrUnder(location, root) || isAtOrUnder(root, location),
+    )
   // denyWrite binds are buffered and emitted after denyRead processing so that
   // a denyRead tmpfs over an ancestor directory doesn't wipe them out.
   const denyWriteArgs: string[] = []
@@ -2433,9 +2479,6 @@ async function generateFilesystemArgs(
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
     // Write restrictions: Start with read-only root, then allow writes to specific paths
-    args.push('--ro-bind', '/', '/')
-    const beneathAllowBinds = args.length
-
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
       // Every path here is a name, and normalizePathForSandbox strips a
@@ -2458,8 +2501,10 @@ async function generateFilesystemArgs(
         `[Sandbox Linux] Processing write path: ${pathPattern} -> ${normalizedPath}`,
       )
 
-      // Skip /dev/* paths since --dev /dev already handles them
-      if (normalizedPath.startsWith('/dev/')) {
+      // The synthetic /dev hides host devices. Only explicitly granted
+      // paths in the shared-memory subtree are brought back.
+      const isSharedMemory = isAtOrUnder(normalizedPath, SHARED_MEMORY_DIR)
+      if (normalizedPath.startsWith('/dev/') && !isSharedMemory) {
         logForDebugging(`[Sandbox Linux] Skipping /dev path: ${normalizedPath}`)
         continue
       }
@@ -2476,6 +2521,9 @@ async function generateFilesystemArgs(
       // This could unexpectedly expose paths the user didn't intend to allow
       try {
         const resolvedPath = realPathOf(normalizedPath)
+        if (isSharedMemory && !isAtOrUnder(resolvedPath, SHARED_MEMORY_DIR)) {
+          continue
+        }
         // Trim trailing slashes before comparing: realpathSync never returns
         // a trailing slash, but normalizedPath may have one, which would cause
         // a false mismatch and incorrectly treat the path as a symlink.
@@ -2499,6 +2547,7 @@ async function generateFilesystemArgs(
 
       args.push('--bind', normalizedPath, normalizedPath)
       allowedWritePaths.push(normalizedPath)
+      if (isSharedMemory) sharedMemoryRoots.push(normalizedPath)
     }
     ancestorPinInsertAt = isAllowedWriteRoot('/')
       ? args.length
@@ -2645,11 +2694,11 @@ async function generateFilesystemArgs(
     // only costs a spurious abort.
     for (const pathPattern of denyPaths) {
       const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
-      if (rawPath.startsWith('/dev/')) {
+      if (isHiddenDevicePath(rawPath)) {
         continue
       }
       const resolvedPath = resolveSymlinkedDenyPath(rawPath, denyPaths)
-      if (resolvedPath === null || resolvedPath.startsWith('/dev/')) {
+      if (resolvedPath === null || isHiddenDevicePath(resolvedPath)) {
         continue
       }
       for (const above of properAncestors(resolvedPath)) {
@@ -2927,8 +2976,8 @@ async function generateFilesystemArgs(
       }
       const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
 
-      // Skip /dev/* paths since --dev /dev already handles them
-      if (rawPath.startsWith('/dev/')) {
+      // The synthetic /dev hides all device paths outside an explicit grant.
+      if (isHiddenDevicePath(rawPath)) {
         continue
       }
 
@@ -2968,10 +3017,8 @@ async function generateFilesystemArgs(
         )
       }
 
-      // Re-check after resolution: a deny path can only now land in /dev (e.g.
-      // a symlink into it), where --dev /dev has already replaced the tree and
-      // a bind would either miss or fight the new devtmpfs.
-      if (normalizedPath.startsWith('/dev/')) {
+      // Re-check because a symlink may resolve into the synthetic device tree.
+      if (isHiddenDevicePath(normalizedPath)) {
         continue
       }
 
@@ -3063,7 +3110,6 @@ async function generateFilesystemArgs(
     }
   } else {
     // No write restrictions: Allow all writes
-    args.push('--bind', '/', '/')
     // Recording '/' makes isWithinAnyAllowedWritePath and isAllowedWriteRoot
     // say so, which is the '/'-write-root shape ancestorPinArgs treats
     // specially. Nothing is ever restored for it: no read-deny tmpfs lands
@@ -3299,22 +3345,33 @@ async function generateFilesystemArgs(
   // each: a symlink spelling would pin the chain of the link, not of where
   // the mount sits. Deny binds, tmpfs units and masks are emitted later and
   // land on top of both pins and covers.
-  const pinArgs = ancestorPinArgs(
-    [
-      ...denyWriteRawDests.keys(),
-      ...fileMasks.map(mask => mask.landing),
-      ...readDenyTmpfsUnits.map(unit => unit.landing),
-    ],
-    {
-      rootIsWriteRoot: isAllowedWriteRoot('/'),
-      isWithinAllowedWrite: isWithinAnyAllowedWritePath,
-      isAllowedWriteRoot,
-    },
-  )
+  const pinSeeds = [
+    ...denyWriteRawDests.keys(),
+    ...fileMasks.map(mask => mask.landing),
+    ...readDenyTmpfsUnits.map(unit => unit.landing),
+  ]
+  const rootIsWriteRoot = isAllowedWriteRoot('/')
+  const pinArgs = ancestorPinArgs(pinSeeds, {
+    rootIsWriteRoot,
+    isWithinAllowedWrite: isWithinAnyAllowedWritePath,
+    isAllowedWriteRoot,
+  })
   args.splice(ancestorPinInsertAt, 0, ...pinArgs)
+  // A writable / does not cover the synthetic /dev. Pin explicit shared
+  // memory grants as independent write roots, underneath their own binds.
+  const sharedMemoryPins =
+    rootIsWriteRoot && sharedMemoryRoots.length > 0
+      ? ancestorPinArgs(pinSeeds, {
+          rootIsWriteRoot: false,
+          isWithinAllowedWrite: dir =>
+            sharedMemoryRoots.some(root => isAtOrUnder(dir, root)),
+          isAllowedWriteRoot: dir => sharedMemoryRoots.includes(dir),
+        })
+      : []
+  args.splice(beneathAllowBinds, 0, ...sharedMemoryPins)
   // What the mandatory denies cost, for the refusal of a profile with too many
   // arguments: the pins above them here, their own binds as they are emitted.
-  const pinned = new Set(pinArgs)
+  const pinned = new Set([...pinArgs, ...sharedMemoryPins])
   const mandatoryDenyPins = new Set<string>()
   for (let i = mandatoryDenyArgsStart; i < denyWriteArgs.length; i += 3) {
     for (
@@ -3480,7 +3537,7 @@ async function generateFilesystemArgs(
     args.push('--ro-bind', emptySource, emptySource)
   }
 
-  return { args, mandatoryDenyArgs }
+  return { args, mandatoryDenyArgs, sharedMemoryRoots }
 }
 
 /**
@@ -3779,7 +3836,11 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
-    const { args: fsArgs, mandatoryDenyArgs } = await generateFilesystemArgs(
+    const {
+      args: fsArgs,
+      mandatoryDenyArgs,
+      sharedMemoryRoots,
+    } = await generateFilesystemArgs(
       readConfig,
       writeConfig,
       maskedFileBinds,
@@ -3790,15 +3851,17 @@ export async function wrapCommandWithSandboxLinux(
       abortSignal,
     )
     const mountsStart = bwrapArgs.length
-    bwrapArgs.push(...fsArgs)
+    bwrapArgs.push(
+      ...(sharedMemoryRoots.length > 0
+        ? withDeviceMount(fsArgs, sharedMemoryRoots)
+        : fsArgs),
+    )
     const mounts = {
       start: mountsStart,
       end: bwrapArgs.length,
       mandatoryDenyArgs,
     }
-
-    // Always bind /dev
-    bwrapArgs.push('--dev', '/dev')
+    if (sharedMemoryRoots.length === 0) bwrapArgs.push('--dev', '/dev')
 
     // ========== PID NAMESPACE ISOLATION ==========
     // IMPORTANT: These must come AFTER filesystem binds for nested bwrap to work

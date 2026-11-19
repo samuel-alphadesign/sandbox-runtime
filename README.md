@@ -567,6 +567,8 @@ bubblewrap binds concrete paths, so glob support is narrower than on macOS:
 - An `allowRead` or `allowWrite` path is bound back over a denied directory only where it really is, so no directory shows under a second name inside the sandbox.
 - `denyRead: ["/"]` denies each directory in `/` (`/proc`, `/dev` and `/sys` aside); a symlink there (`/bin`, `/lib` on a usr-merged system) gets no mount of its own, because what it leads to is denied together with the directory that holds it.
 
+An explicit `allowWrite` path at or beneath `/dev/shm` is bound from the host after bubblewrap sets up its synthetic `/dev`. The grant applies to that path and its contents. Other host device paths stay hidden, and read and write restrictions still apply within the grant.
+
 Examples:
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
